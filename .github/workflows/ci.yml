@@ -12,7 +12,12 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [ubicloud, ubicloud-arm]
+    name: Build and test - ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.runs-on }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -26,6 +31,7 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-18 libbpf-dev
 
     - name: Verify the committed object is reproducible
+      if: matrix.runs-on == 'ubicloud'
       run: |
         make -B internal/ndpproxy/bpf/ndp_proxy.bpf.o
         git diff --exit-code internal/ndpproxy/bpf/ndp_proxy.bpf.o
