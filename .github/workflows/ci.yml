@@ -1,0 +1,43 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+
+    - name: Install clang
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-18 libbpf-dev
+
+    - name: Verify the committed object is reproducible
+      run: |
+        make -B internal/ndpproxy/bpf/ndp_proxy.bpf.o
+        git diff --exit-code internal/ndpproxy/bpf/ndp_proxy.bpf.o
+
+    - name: Build
+      run: make
+
+    - name: Vet and unit test
+      run: |
+        test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+        go vet ./...
+        go test ./...
+
+    - name: Integration rig
+      run: sudo apt-get install -y --no-install-recommends ndisc6 && sudo ./test/run_tests.sh

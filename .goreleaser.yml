@@ -1,0 +1,29 @@
+version: 2
+
+before:
+  hooks:
+    # The BPF object is embedded, so it must exist before the Go build. It is
+    # architecture independent: -target bpf emits little-endian bytecode that
+    # both x86_64 and arm64 hosts load.
+    - make internal/ndpproxy/bpf/ndp_proxy.bpf.o
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
