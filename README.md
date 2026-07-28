@@ -87,11 +87,12 @@ make          # compile the BPF object, then the binary
 make test     # go vet, unit tests, and the integration rig (needs root)
 ```
 
-`internal/ndpproxy/bpf/ndp_proxy.bpf.o` is committed and embedded into the
-binary; CI recompiles it with the pinned clang and fails if the result
-differs. The Go unit tests assert that the map key/value sizes and counter
-count still match the compiled object, which is what keeps the loader's
-structs honest.
+`make` compiles `ndp_proxy.bpf.c` and embeds the result into the binary. The
+object is a build artifact rather than a committed one, so what ships is
+always derived from the source in the same commit; `go build` on its own
+will fail until `make` has produced it. The Go unit tests assert that the
+map key/value sizes and counter count still match the compiled object,
+which is what keeps the loader's structs honest.
 
 `test/run_tests.sh` builds two network namespaces -- a simulated on-link
 provider router and a host with a stub `vetho` carrying a delegated /79 --
