@@ -248,7 +248,9 @@ func linkAttachedTo(l link.Link, uplink Uplink) bool {
 
 // pinMaps pins the freshly loaded maps at their well-known paths. replace
 // must be true when a previous generation of the program is already pinned
-// there, so its now-stale pins are cleared first.
+// there: each new map is pinned to a side path and renamed over the old
+// pin, so a concurrent reader (counters, drift checks) never sees the path
+// briefly missing.
 func pinMaps(objs *objects, replace bool) error {
 	if err := os.MkdirAll(mapsDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", mapsDir, err)
@@ -260,13 +262,21 @@ func pinMaps(objs *objects, replace bool) error {
 		"counters": objs.Counters, "rate": objs.Rate,
 	} {
 		path := filepath.Join(mapsDir, name)
-		if replace {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("remove old pin %s: %w", path, err)
+		if !replace {
+			if err := m.Pin(path); err != nil {
+				return fmt.Errorf("pin map %s: %w", name, err)
 			}
+			continue
 		}
-		if err := m.Pin(path); err != nil {
+		tmp := path + ".new"
+		if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale %s: %w", tmp, err)
+		}
+		if err := m.Pin(tmp); err != nil {
 			return fmt.Errorf("pin map %s: %w", name, err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return fmt.Errorf("swap pin for map %s: %w", name, err)
 		}
 	}
 	return nil
