@@ -70,12 +70,21 @@ host-ebpf ndp-proxy counters [-json]
 host-ebpf ndp-proxy detach
 ```
 
-`apply` is idempotent: it tears down any previous attachment, so counters
-restart from zero. `verify` exits non-zero when the attachment has drifted,
-naming what drifted and printing the counters it is about to lose; with
-`-heal` it re-applies first. Program and maps are pinned under
-`/sys/fs/bpf/ndp-proxy`; neither pins nor attachments survive a reboot, so
-whatever installs this must re-run `apply` at boot.
+`apply` is safe to call repeatedly, but it is not idempotent: every call
+loads a fresh program and maps, so counters always restart from zero, even
+when reapplying the same uplink and prefix. When a previous attachment
+already exists on the requested uplink, `apply` swaps the new program into
+it in place -- TCX links support updating the attached program without
+detaching, so solicitations keep being answered throughout. It only falls
+back to detaching and reattaching from scratch, with a brief window where
+solicitations go unanswered, when there is no usable existing attachment to
+update (first run on a host, or one whose uplink changed).
+
+`verify` exits non-zero when the attachment has drifted, naming what
+drifted and printing the counters it is about to lose; with `-heal` it
+re-applies first. Program and maps are pinned under `/sys/fs/bpf/ndp-proxy`;
+neither pins nor attachments survive a reboot, so whatever installs this
+must re-run `apply` at boot.
 
 Requires kernel 6.6 or newer: `BPF_FIB_LOOKUP_SKIP_NEIGH` landed in 6.4 and
 TCX links in 6.6.

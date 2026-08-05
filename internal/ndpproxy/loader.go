@@ -157,8 +157,17 @@ func parsePrefix(cidr string) (prefixKey, error) {
 }
 
 // Apply loads the program, points it at the uplink, restricts it to prefix,
-// and attaches it. It is idempotent: any previous attachment is torn down
-// first, so counters restart from zero.
+// and attaches it.
+//
+// It is safe to call repeatedly, but it is not idempotent: every call loads
+// a fresh copy of the program and its maps, so counters always restart from
+// zero, even when applying the same uplink and prefix as before. When a
+// previous attachment already exists on the requested uplink, Apply swaps
+// the new program into it in place via the TCX link's atomic update, so
+// solicitations keep being answered throughout. Only when there is no
+// usable existing attachment — the first apply on a host, or one whose
+// uplink changed — does Apply fall back to detaching and reattaching from
+// scratch, which does have a brief window with no attachment at all.
 func Apply(uplinkName, prefix string) error {
 	key, err := parsePrefix(prefix)
 	if err != nil {
@@ -172,13 +181,6 @@ func Apply(uplinkName, prefix string) error {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
 
-	if err := Detach(); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(mapsDir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", mapsDir, err)
-	}
-
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(objectBytes))
 	if err != nil {
 		return fmt.Errorf("load object: %w", err)
@@ -189,22 +191,31 @@ func Apply(uplinkName, prefix string) error {
 	}
 	defer objs.Close()
 
-	// Pin explicitly rather than declaring LIBBPF_PIN_BY_NAME in the C, so
-	// the program stays loadable by any other harness.
-	for name, m := range map[string]*ebpf.Map{
-		"cfg": objs.Cfg, "cfg_prefixes": objs.CfgPrefixes,
-		"counters": objs.Counters, "rate": objs.Rate,
-	} {
-		if err := m.Pin(filepath.Join(mapsDir, name)); err != nil {
-			return fmt.Errorf("pin map %s: %w", name, err)
-		}
-	}
-
 	if err := objs.Cfg.Put(uint32(0), cfgValue{UplinkIfindex: uplink.Index, UplinkMac: uplink.Mac}); err != nil {
 		return fmt.Errorf("write cfg: %w", err)
 	}
 	if err := objs.CfgPrefixes.Put(key, uint8(1)); err != nil {
 		return fmt.Errorf("write prefix: %w", err)
+	}
+
+	if existing, err := link.LoadPinnedLink(linkPin, nil); err == nil {
+		updated := linkAttachedTo(existing, uplink) && existing.Update(objs.Prog) == nil
+		existing.Close()
+		if updated {
+			if err := pinMaps(&objs, true); err != nil {
+				return err
+			}
+			return setAllmulti(uplinkName)
+		}
+		// The pinned link can't be updated in place (wrong interface, or the
+		// kernel rejected the swap); fall through to a full teardown below.
+	}
+
+	if err := Detach(); err != nil {
+		return err
+	}
+	if err := pinMaps(&objs, false); err != nil {
+		return err
 	}
 
 	l, err := link.AttachTCX(link.TCXOptions{
@@ -221,6 +232,44 @@ func Apply(uplinkName, prefix string) error {
 	}
 
 	return setAllmulti(uplinkName)
+}
+
+// linkAttachedTo reports whether l is a TCX link attached to uplink. Update
+// swaps the program on a link in place but cannot retarget its interface, so
+// callers must check this before relying on it.
+func linkAttachedTo(l link.Link, uplink Uplink) bool {
+	info, err := l.Info()
+	if err != nil {
+		return false
+	}
+	tcx := info.TCX()
+	return tcx != nil && uint32(tcx.Ifindex) == uplink.Index
+}
+
+// pinMaps pins the freshly loaded maps at their well-known paths. replace
+// must be true when a previous generation of the program is already pinned
+// there, so its now-stale pins are cleared first.
+func pinMaps(objs *objects, replace bool) error {
+	if err := os.MkdirAll(mapsDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", mapsDir, err)
+	}
+	// Pin explicitly rather than declaring LIBBPF_PIN_BY_NAME in the C, so
+	// the program stays loadable by any other harness.
+	for name, m := range map[string]*ebpf.Map{
+		"cfg": objs.Cfg, "cfg_prefixes": objs.CfgPrefixes,
+		"counters": objs.Counters, "rate": objs.Rate,
+	} {
+		path := filepath.Join(mapsDir, name)
+		if replace {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove old pin %s: %w", path, err)
+			}
+		}
+		if err := m.Pin(path); err != nil {
+			return fmt.Errorf("pin map %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // Detach removes the attachment and all pinned state, leaving allmulti alone
