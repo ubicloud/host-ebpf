@@ -70,8 +70,10 @@ host-ebpf ndp-proxy counters [-json]
 host-ebpf ndp-proxy detach
 ```
 
-`apply` is idempotent: it tears down any previous attachment, so counters
-restart from zero. `verify` exits non-zero when the attachment has drifted,
+`apply` is idempotent: it loads and verifies the new program before touching
+the existing attachment, then swaps it in on the pinned link, so a bad object
+leaves the old proxy answering rather than none. Counters restart from zero
+because the maps are new. `verify` exits non-zero when the attachment has drifted,
 naming what drifted and printing the counters it is about to lose; with
 `-heal` it re-applies first. Program and maps are pinned under
 `/sys/fs/bpf/ndp-proxy`; neither pins nor attachments survive a reboot, so

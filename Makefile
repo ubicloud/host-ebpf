@@ -1,5 +1,5 @@
-# The committed object must be byte-reproducible: CI recompiles with the
-# pinned clang and fails if the result differs.
+# The object is a build artifact embedded into the binary, compiled with the
+# pinned clang so what ships is always derived from the source alongside it.
 CLANG ?= clang-18
 OBJ := internal/ndpproxy/bpf/ndp_proxy.bpf.o
 
@@ -17,6 +17,7 @@ host-ebpf: $(OBJ) $(wildcard *.go internal/ndpproxy/*.go)
 
 test: host-ebpf
 	go vet ./...
+	go test ./...
 	sudo ./test/run_tests.sh
 
 clean:

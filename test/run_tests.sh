@@ -9,6 +9,7 @@
 #
 #   ndp-router [rt0] 2001:db8:aa::1/64 <--veth--> [up0] 2001:db8:aa::2/64 [ndp-host]
 #                                                  vetho0 <- 2001:db8:aa:0:1388::/79
+#                                                  vetho0 <- 2001:db8:aa:0:2000::/79 via fe80::1 (the production shape)
 #                                                  vetho0 <- 2001:db8:bb::/64 (outside the configured prefix)
 set -ueo pipefail
 
@@ -18,6 +19,7 @@ NET6_HOST=2001:db8:aa::2
 NET6_ROUTER=2001:db8:aa::1
 PREFIX=2001:db8:aa::/64
 VM_TARGET=2001:db8:aa:0:1388::2
+GW_TARGET=2001:db8:aa:0:2000::2
 UNALLOCATED=2001:db8:aa::dead
 FOREIGN_ROUTED=2001:db8:bb::1
 
@@ -52,6 +54,9 @@ ip -n ndp-host addr add "$NET6_HOST/64" dev up0 nodad
 ip -n ndp-host link add vetho0 type dummy
 ip -n ndp-host link set vetho0 up
 ip -n ndp-host route add 2001:db8:aa:0:1388::/79 dev vetho0
+# VmSetup routes a VM's prefix via the vethi link-local address; nothing ever
+# resolves that neighbor from the host side.
+ip -n ndp-host route add 2001:db8:aa:0:2000::/79 via fe80::1 dev vetho0
 ip -n ndp-host route add 2001:db8:bb::/64 dev vetho0
 
 # The loader pins under /sys/fs/bpf, which "ip netns exec" hides by
@@ -128,6 +133,13 @@ OUT=$(ip netns exec ndp-router ndisc6 -w 2000 -r 2 "$VM_TARGET" rt0 2>&1) &&
   pass "delegated target answered with uplink MAC" ||
   fail "delegated target not answered: $OUT"
 
+# 1b. The production route shape: a gateway route through a link-local
+#     nexthop with no neighbor entry, which SKIP_NEIGH makes resolvable.
+OUT=$(ip netns exec ndp-router ndisc6 -w 2000 -r 2 "$GW_TARGET" rt0 2>&1) &&
+  echo "$OUT" | grep -qi "$UP_MAC" &&
+  pass "gateway-routed target answered with uplink MAC" ||
+  fail "gateway-routed target not answered: $OUT"
+
 # 2. Unallocated address in the /64: best route is the uplink itself, no NA.
 ip netns exec ndp-router ndisc6 -w 1000 -r 1 "$UNALLOCATED" rt0 >/dev/null 2>&1 &&
   fail "unallocated address was answered" ||
@@ -183,8 +195,20 @@ ip -n ndp-router -j addr show dev rt0 | grep -q dadfailed &&
 [ "$(counter pass_dad)" -ge 1 ] &&
   pass "dad counter moved" || fail "dad counter still zero"
 
-[ "$(counter answered)" -ge 2 ] &&
+[ "$(counter answered)" -ge 3 ] &&
   pass "answered counter consistent" || fail "answered counter below expectation"
+
+# 8b. Re-applying swaps the program in on the pinned link: the attachment
+#     stays healthy, counters restart with the new maps, and answers continue.
+in_host "$BIN" ndp-proxy apply -uplink up0 -prefix "$PREFIX"
+in_host "$BIN" ndp-proxy verify -uplink up0 -prefix "$PREFIX" >/dev/null &&
+  pass "re-apply keeps the attachment healthy" || fail "re-apply left drift"
+[ "$(counter answered)" -eq 0 ] &&
+  pass "re-apply restarted the counters" || fail "counters survived re-apply"
+OUT=$(ip netns exec ndp-router ndisc6 -w 2000 -r 2 "$VM_TARGET" rt0 2>&1) &&
+  echo "$OUT" | grep -qi "$UP_MAC" &&
+  pass "delegated target answered after re-apply" ||
+  fail "delegated target not answered after re-apply: $OUT"
 
 # 9. A healthy attachment reports no drift.
 in_host "$BIN" ndp-proxy verify -uplink up0 -prefix "$PREFIX" >/dev/null &&

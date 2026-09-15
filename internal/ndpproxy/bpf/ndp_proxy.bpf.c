@@ -19,8 +19,7 @@
 #define ND_NEIGHBOR_SOLICIT 135
 #define ND_NEIGHBOR_ADVERT 136
 
-/* Index order is mirrored by COUNTER_NAMES in
- * rhizome/host/lib/ndp_proxy_setup.rb. */
+/* Index order is mirrored by CounterNames in internal/ndpproxy/loader.go. */
 enum ndp_counter {
 	COUNTER_SEEN_NS,
 	COUNTER_ANSWERED,
