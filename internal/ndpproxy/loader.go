@@ -157,8 +157,10 @@ func parsePrefix(cidr string) (prefixKey, error) {
 }
 
 // Apply loads the program, points it at the uplink, restricts it to prefix,
-// and attaches it. It is idempotent: any previous attachment is torn down
-// first, so counters restart from zero.
+// and attaches it. The program already attached keeps answering until the
+// new one has passed the verifier and is configured, then the pinned link
+// swaps to it in place, so a bad object leaves the host with the old proxy
+// rather than none. Counters restart from zero because the maps are new.
 func Apply(uplinkName, prefix string) error {
 	key, err := parsePrefix(prefix)
 	if err != nil {
@@ -172,13 +174,6 @@ func Apply(uplinkName, prefix string) error {
 		return fmt.Errorf("remove memlock: %w", err)
 	}
 
-	if err := Detach(); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(mapsDir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", mapsDir, err)
-	}
-
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(objectBytes))
 	if err != nil {
 		return fmt.Errorf("load object: %w", err)
@@ -189,8 +184,32 @@ func Apply(uplinkName, prefix string) error {
 	}
 	defer objs.Close()
 
-	// Pin explicitly rather than declaring LIBBPF_PIN_BY_NAME in the C, so
-	// the program stays loadable by any other harness.
+	if err := objs.Cfg.Put(uint32(0), cfgValue{UplinkIfindex: uplink.Index, UplinkMac: uplink.Mac}); err != nil {
+		return fmt.Errorf("write cfg: %w", err)
+	}
+	if err := objs.CfgPrefixes.Put(key, uint8(1)); err != nil {
+		return fmt.Errorf("write prefix: %w", err)
+	}
+
+	if err := os.MkdirAll(PinDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", PinDir, err)
+	}
+	l, err := attach(objs.Prog, uplink)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+
+	// The link runs the new program from here on, and these are its maps; the
+	// pins are only how verify and counters reach them. Pin explicitly rather
+	// than declaring LIBBPF_PIN_BY_NAME in the C, so the program stays
+	// loadable by any other harness.
+	if err := os.RemoveAll(mapsDir); err != nil {
+		return fmt.Errorf("remove %s: %w", mapsDir, err)
+	}
+	if err := os.MkdirAll(mapsDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", mapsDir, err)
+	}
 	for name, m := range map[string]*ebpf.Map{
 		"cfg": objs.Cfg, "cfg_prefixes": objs.CfgPrefixes,
 		"counters": objs.Counters, "rate": objs.Rate,
@@ -200,27 +219,56 @@ func Apply(uplinkName, prefix string) error {
 		}
 	}
 
-	if err := objs.Cfg.Put(uint32(0), cfgValue{UplinkIfindex: uplink.Index, UplinkMac: uplink.Mac}); err != nil {
-		return fmt.Errorf("write cfg: %w", err)
-	}
-	if err := objs.CfgPrefixes.Put(key, uint8(1)); err != nil {
-		return fmt.Errorf("write prefix: %w", err)
+	return setAllmulti(uplinkName)
+}
+
+// attach swaps prog into the pinned link when one is attached to uplink,
+// which replaces the running program atomically. Otherwise it attaches a
+// fresh link and only then drops whatever held the pin: a link on another
+// interface, or one from an incompatible version.
+func attach(prog *ebpf.Program, uplink Uplink) (link.Link, error) {
+	old, loadErr := link.LoadPinnedLink(linkPin, nil)
+	if loadErr == nil && attachedTo(old) == uplink.Index {
+		if err := old.Update(prog); err != nil {
+			old.Close()
+			return nil, fmt.Errorf("update link on %s: %w", uplink.Name, err)
+		}
+		return old, nil
 	}
 
 	l, err := link.AttachTCX(link.TCXOptions{
-		Program:   objs.Prog,
+		Program:   prog,
 		Attach:    ebpf.AttachTCXIngress,
 		Interface: int(uplink.Index),
 	})
 	if err != nil {
-		return fmt.Errorf("attach to %s: %w", uplinkName, err)
+		if loadErr == nil {
+			old.Close()
+		}
+		return nil, fmt.Errorf("attach to %s: %w", uplink.Name, err)
 	}
-	defer l.Close()
+	if loadErr == nil {
+		old.Unpin()
+		old.Close()
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		os.Remove(linkPin)
+	}
 	if err := l.Pin(linkPin); err != nil {
-		return fmt.Errorf("pin link: %w", err)
+		l.Close()
+		return nil, fmt.Errorf("pin link: %w", err)
 	}
+	return l, nil
+}
 
-	return setAllmulti(uplinkName)
+func attachedTo(l link.Link) uint32 {
+	info, err := l.Info()
+	if err != nil {
+		return 0
+	}
+	if tcx := info.TCX(); tcx != nil {
+		return uint32(tcx.Ifindex)
+	}
+	return 0
 }
 
 // Detach removes the attachment and all pinned state, leaving allmulti alone
